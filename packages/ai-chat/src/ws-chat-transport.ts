@@ -82,6 +82,13 @@ export class WebSocketChatTransport<
     const requestId = nanoid(8);
     const abortController = new AbortController();
     let completed = false;
+    let abortRequested = false;
+    let streamController:
+      | ReadableStreamDefaultController<UIMessageChunk>
+      | undefined;
+
+    const abortError = new Error("Aborted");
+    abortError.name = "AbortError";
 
     // Build the request body
     let extraBody: Record<string, unknown> = {};
@@ -107,25 +114,64 @@ export class WebSocketChatTransport<
     // Track this request so the onAgentMessage handler skips it
     this.activeRequestIds?.add(requestId);
 
-    // Handle abort from the caller (only if the stream has not already completed)
-    options.abortSignal?.addEventListener("abort", () => {
-      if (completed) return;
-      this.agent.send(
-        JSON.stringify({
-          id: requestId,
-          type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
-        })
-      );
-      this.activeRequestIds?.delete(requestId);
-      abortController.abort();
-    });
-
     // Create a ReadableStream<UIMessageChunk> that emits parsed chunks
     // as they arrive over the WebSocket
     const agent = this.agent;
     const activeIds = this.activeRequestIds;
+
+    const completeAbort = () => {
+      if (completed) return;
+      completed = true;
+
+      try {
+        streamController?.error(abortError);
+      } catch {
+        // Stream may already be closed
+      }
+
+      activeIds?.delete(requestId);
+      abortController.abort();
+    };
+
+    const requestAbort = () => {
+      if (completed || abortRequested) return;
+      abortRequested = true;
+
+      try {
+        agent.send(
+          JSON.stringify({
+            id: requestId,
+            type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
+          })
+        );
+      } catch {
+        // Ignore failures (e.g. agent already disconnected)
+      }
+
+      // Clean up tracking immediately so the message handler doesn't
+      // treat this request as active while cancellation is in flight.
+      activeIds?.delete(requestId);
+
+      // Always abort the internal controller to detach the WS listener.
+      // If the stream controller isn't available yet, it will be completed
+      // in start().
+      if (streamController) {
+        completeAbort();
+        return;
+      }
+
+      abortController.abort();
+    };
+
     const stream = new ReadableStream<UIMessageChunk>({
       start(controller) {
+        streamController = controller;
+
+        if (abortRequested) {
+          completeAbort();
+          return;
+        }
+
         const onMessage = (event: MessageEvent) => {
           try {
             const data = JSON.parse(
@@ -173,9 +219,17 @@ export class WebSocketChatTransport<
         });
       },
       cancel() {
-        abortController.abort();
+        requestAbort();
       }
     });
+
+    // Handle abort from the caller (only if the stream has not already completed)
+    if (options.abortSignal) {
+      options.abortSignal.addEventListener("abort", requestAbort, {
+        once: true
+      });
+      if (options.abortSignal.aborted) requestAbort();
+    }
 
     // Send the request over WebSocket
     agent.send(
